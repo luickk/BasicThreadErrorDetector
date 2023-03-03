@@ -55,17 +55,11 @@ module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
         bool ok = drwrap_wrap(towrap_unlock, wrap_pre_unlock, NULL);
         DR_ASSERT(ok);
     }
-}
-
-static void
-module_unload_event(void *drcontext, const module_data_t *mod)
-{
-
     size_t modoffs_malloc;
     drsym_error_t sym_res_malloc = drsym_lookup_symbol(mod->full_path, "malloc", &modoffs_malloc, DRSYM_DEMANGLE);
     if (sym_res_malloc == DRSYM_SUCCESS) {
         app_pc towrap_malloc = mod->start + modoffs_malloc;
-        bool ok = drwrap_unwrap(towrap_malloc, wrap_post_malloc, NULL);
+        bool ok = drwrap_wrap(towrap_malloc, NULL, wrap_post_malloc);
         DR_ASSERT(ok);
     }
 }
@@ -348,9 +342,7 @@ static void event_exit(void) {
     dr_mutex_destroy(mutex);
     drutil_exit();
     drmgr_exit();
-    drx_exit();
-    drmgr_register_module_unload_event(module_unload_event);
-    drcallstack_exit();
+    drx_exit();    drcallstack_exit();
     drwrap_exit();
     drsym_exit();
 }

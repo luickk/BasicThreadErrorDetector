@@ -1,6 +1,7 @@
 #include "include/memtrace.h"
 
 #define MAX_THREADS 100
+#define MAX_ALLOCS 10000
 const u64 linear_set_size_increment = 1000000;
 
 // todo => shrink to 8 bytes. Should be possible if memory address access/accessing only store 
@@ -18,6 +19,12 @@ typedef struct LockAccess {
    usize lock_address;
    u32 callee_thread_id;
 } LockAccess;
+
+typedef struct MemoryAllocation {
+   usize addr;
+   u64 size;
+   u32 callee_thread_id;
+} MemoryAllocation;
 
 typedef struct ThreadState {
     u64 thread_id;
@@ -38,8 +45,21 @@ typedef struct ThreadState {
     u64 lock_lock_set_len;
 } ThreadState;
 
+
+// max allocations is seperate from thread state since it needs to be itreated thorugh on every error check
+MemoryAllocation allocations[MAX_ALLOCS] = {};
+u64 n_allocs = 0;
+
 ThreadState threads[MAX_THREADS] = {};
 u64 n_threads = 0;
+
+
+// util fns..
+void *increase_set_capacity(void *set, u64 *set_capacity) {
+    *set_capacity += linear_set_size_increment;
+    printf("new set_capacity: %ld \n", *set_capacity);
+    return realloc(set, *set_capacity);
+}
 
 i64 findThreadByTId(u64 tid) {
     u64 i;
@@ -50,6 +70,8 @@ i64 findThreadByTId(u64 tid) {
     }
     return -1;
 }
+// util fns..
+
 
 void mem_analyse_exit() { 
     u64 j;
@@ -116,11 +138,6 @@ void mem_analyse_thread_exit() {
     // printf("thread exit \n");
 }
 
-void *increase_set_capacity(void *set, u64 *set_capacity) {
-    *set_capacity += linear_set_size_increment;
-    printf("new set_capacity: %ld \n", *set_capacity);
-    return realloc(set, *set_capacity);
-}
 
 void wrap_pre_unlock(void *wrapcxt, OUT void **user_data) {
     void *addr = drwrap_get_arg(wrapcxt, 0);
@@ -131,10 +148,10 @@ void wrap_pre_unlock(void *wrapcxt, OUT void **user_data) {
         // printf("error finding thread_id. %ld \n", thread_id);
         return;    
     }
-    ThreadState *curr_thread = &threads[t_index];
-    curr_thread->lock_unlock_set[curr_thread->lock_unlock_set_len].lock_address = (u64)addr;
-    curr_thread->lock_unlock_set[curr_thread->lock_unlock_set_len].callee_thread_id = thread_id;
-    curr_thread->lock_unlock_set_len += 1;
+    ThreadState *thread_accessed = &threads[t_index];
+    thread_accessed->lock_unlock_set[thread_accessed->lock_unlock_set_len].lock_address = (u64)addr;
+    thread_accessed->lock_unlock_set[thread_accessed->lock_unlock_set_len].callee_thread_id = thread_id;
+    thread_accessed->lock_unlock_set_len += 1;
 }
 
 void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
@@ -146,27 +163,26 @@ void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
     if (t_index < 0) {
         // printf("error finding thread_id. %ld \n", thread_id);
         return;        }
-    ThreadState *curr_thread = &threads[t_index];
-    curr_thread->lock_lock_set[curr_thread->lock_lock_set_len].lock_address = (u64)addr;
-    curr_thread->lock_lock_set[curr_thread->lock_lock_set_len].callee_thread_id = thread_id;
-    curr_thread->lock_lock_set_len += 1;
+    ThreadState *thread_accessed = &threads[t_index];
+    thread_accessed->lock_lock_set[thread_accessed->lock_lock_set_len].lock_address = (u64)addr;
+    thread_accessed->lock_lock_set[thread_accessed->lock_lock_set_len].callee_thread_id = thread_id;
+    thread_accessed->lock_lock_set_len += 1;
 }
-
-
-void wrap_post_malloc(void *wrapcxt, OUT void **user_data) {
+void wrap_post_malloc(void *wrapcxt, void *user_data) {
     void *addr = drwrap_get_retval(wrapcxt);
     // todo => wrong id
     u64 thread_id = dr_get_thread_id(wrapcxt);
-    // printf("pthread_lock called %ld \n", thread_id);
-    i64 t_index = findThreadByTId(thread_id);
-    if (t_index < 0) {
-        // printf("error finding thread_id. %ld \n", thread_id);
-        // return;    
+    // printf("malloc called %p in tid %ld\n", (void*)0x0, thread_id);
+
+    int j;
+    for(j = 0; j < n_threads; j++) {
+        if (threads[j].thread_id == thread_id) break;
+        if (j == n_threads-1) return;
     }
-    ThreadState *curr_thread = &threads[t_index];
-    curr_thread->lock_lock_set[curr_thread->lock_lock_set_len].lock_address = (u64)addr;
-    curr_thread->lock_lock_set[curr_thread->lock_lock_set_len].callee_thread_id = thread_id;
-    curr_thread->lock_lock_set_len += 1;
+    printf("%d \n", thread_id);
+    allocations[n_allocs].addr = (usize)addr;
+    allocations[n_allocs].callee_thread_id = 0;
+    n_allocs += 1;
 }
 
 // this is an event like fn that is envoked on every memory access (called by DynamRIO)
@@ -181,26 +197,41 @@ void memtrace(void *drcontext, u64 thread_id) {
         // printf("error finding thread_id. %ld \n", thread_id);
         return;    
     }
-    ThreadState *curr_thread = &threads[t_index];
     for (mem_ref = (mem_ref_t *)data->buf_base; mem_ref < buf_ptr; mem_ref++) {
+        int j;
+        for(j = 0; j < n_allocs; j++) {
+            if ((usize)mem_ref->addr == allocations[j].addr) break;
+            if (j == n_allocs-1) return;
+        }
+        // no allocations, no mem shared
+        if (n_allocs <= 0) return;
+        u64 thread_id_owning_accessed_addr = allocations[j].callee_thread_id;
+
+        u64 thread_states_index_owning_accessed_addr = findThreadByTId(thread_id_owning_accessed_addr);
+        if (thread_states_index_owning_accessed_addr < 0) {
+            printf("error finding thread_id. %ld \n", thread_id);
+            return;    
+        }
+        ThreadState *thread_accessed = &threads[thread_states_index_owning_accessed_addr];
+        // printf("adding %d \n", thread_states_index_owning_accessed_addr);
         if (mem_ref->type == 1 || mem_ref->type == 457 || mem_ref->type == 458 || mem_ref->type == 456 || mem_ref->type == 568) {
             // mem write
-            if (curr_thread->mem_write_set_len >= curr_thread->mem_write_set_capacity) curr_thread->mem_write_set = increase_set_capacity(curr_thread->mem_write_set, &curr_thread->mem_write_set_capacity);
-            if (curr_thread->mem_write_set == NULL) exit(1);
-            curr_thread->mem_write_set[curr_thread->mem_write_set_len].address_accessed = (usize)mem_ref->addr;
-            curr_thread->mem_write_set[curr_thread->mem_write_set_len].opcode = mem_ref->type;
-            curr_thread->mem_write_set[curr_thread->mem_write_set_len].callee_thread_id = thread_id;
-            curr_thread->mem_write_set[curr_thread->mem_write_set_len].size = mem_ref->size;
-            curr_thread->mem_write_set_len += 1;
+            if (thread_accessed->mem_write_set_len >= thread_accessed->mem_write_set_capacity) thread_accessed->mem_write_set = increase_set_capacity(thread_accessed->mem_write_set, &thread_accessed->mem_write_set_capacity);
+            if (thread_accessed->mem_write_set == NULL) exit(1);
+            thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].address_accessed = (usize)mem_ref->addr;
+            thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].opcode = mem_ref->type;
+            thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].callee_thread_id = thread_id;
+            thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].size = mem_ref->size;
+            thread_accessed->mem_write_set_len += 1;
         } else if(mem_ref->type == 0 || mem_ref->type == 227 || mem_ref->type == 225 || mem_ref->type == 197 || mem_ref->type == 228 || mem_ref->type == 229 || mem_ref->type == 299 || mem_ref->type == 173) {
             // mem read
-            if (curr_thread->mem_read_set_len >= curr_thread->mem_read_set_capacity) curr_thread->mem_read_set = increase_set_capacity(curr_thread->mem_read_set, &curr_thread->mem_read_set_capacity);
-            if (curr_thread->mem_read_set == NULL) exit(1);
-            curr_thread->mem_read_set[curr_thread->mem_read_set_len].address_accessed = (usize)mem_ref->addr;
-            curr_thread->mem_read_set[curr_thread->mem_read_set_len].opcode = mem_ref->type;
-            curr_thread->mem_read_set[curr_thread->mem_read_set_len].callee_thread_id = thread_id;
-            curr_thread->mem_read_set[curr_thread->mem_read_set_len].size = mem_ref->size;
-            curr_thread->mem_read_set_len += 1;
+            if (thread_accessed->mem_read_set_len >= thread_accessed->mem_read_set_capacity) thread_accessed->mem_read_set = increase_set_capacity(thread_accessed->mem_read_set, &thread_accessed->mem_read_set_capacity);
+            if (thread_accessed->mem_read_set == NULL) exit(1);
+            thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].address_accessed = (usize)mem_ref->addr;
+            thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].opcode = mem_ref->type;
+            thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].callee_thread_id = thread_id;
+            thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].size = mem_ref->size;
+            thread_accessed->mem_read_set_len += 1;
         }
         //  else {
         //     printf("missed %d \n", mem_ref->type);        
@@ -211,3 +242,4 @@ void memtrace(void *drcontext, u64 thread_id) {
     }
     BUF_PTR(data->seg_base) = data->buf_base;
 }
+

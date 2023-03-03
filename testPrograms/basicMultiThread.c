@@ -5,6 +5,7 @@
 
 // Let us create a global variable to change it in threads
 int g = 0;
+int *heap_storage;
 pthread_mutex_t mutex_g = PTHREAD_MUTEX_INITIALIZER;
 
 // The function to be executed by all threads
@@ -12,14 +13,16 @@ void *myThreadFun(void *vargp) {
 	// Store the value argument passed to this thread
 	int *myid = (int *)vargp;
 
+	pthread_mutex_lock(&mutex_g);
+	heap_storage[10] = 1;
+	pthread_mutex_unlock(&mutex_g);
+
 	// Let us create a static variable to observe its changes
 	static int s = 0;
 
 	// Change static and global variables
 	++s; 
-	pthread_mutex_lock(&mutex_g);
 	++g;
-	pthread_mutex_unlock(&mutex_g);
 
 	// Print the argument, static and global variables
 	printf("Thread ID: %d, Static: %d, Global: %d\n", *myid, ++s, ++g);
@@ -29,7 +32,10 @@ void *myThreadFun(void *vargp) {
 int main() {
 	int i;
 	pthread_t tid;
+	printf("before print\n");
 
+	heap_storage = malloc(4096*sizeof(int));   // same, without repeating the type name
+	printf("after %p \n", heap_storage); 
 	// Let us create three threads
 	for (i = 0; i < 3; i++)
 		pthread_create(&tid, NULL, myThreadFun, (void *)&tid);
