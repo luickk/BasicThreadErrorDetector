@@ -59,7 +59,7 @@ module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
     drsym_error_t sym_res_malloc = drsym_lookup_symbol(mod->full_path, "malloc", &modoffs_malloc, DRSYM_DEMANGLE);
     if (sym_res_malloc == DRSYM_SUCCESS) {
         app_pc towrap_malloc = mod->start + modoffs_malloc;
-        bool ok = drwrap_wrap(towrap_malloc, NULL, wrap_post_malloc);
+        bool ok = drwrap_wrap(towrap_malloc, wrap_pre_malloc, wrap_post_malloc);
         DR_ASSERT(ok);
     }
 }
@@ -294,7 +294,7 @@ event_pre_syscall(void *drcontext, int sysnum)
 
 static void event_thread_init(void *drcontext) {
     u64 thread_id = dr_get_thread_id(drcontext);
-    if(!mem_analyse_new_thread_init(thread_id)) DR_ASSERT(false);
+    if(!mem_analyse_new_thread_init(drcontext)) DR_ASSERT(false);
     per_thread_t *data = dr_thread_alloc(drcontext, sizeof(per_thread_t));
     DR_ASSERT(data != NULL);
     drmgr_set_tls_field(drcontext, tls_idx, data);
