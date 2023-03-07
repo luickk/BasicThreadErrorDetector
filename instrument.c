@@ -1,4 +1,4 @@
-#include "include/memtrace.h"
+#include "include/instrument.h"
 
 static client_id_t client_id;
 static void *mutex;        /* for multithread support */

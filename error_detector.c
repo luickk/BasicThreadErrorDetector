@@ -1,4 +1,4 @@
-#include "include/memtrace.h"
+#include "include/instrument.h"
 
 #define MAX_THREADS 100
 #define MAX_ALLOCS 10000
@@ -12,18 +12,26 @@ typedef struct MemoryAccess {
    usize address_accessed;
    u16 opcode;
    u64 size;
-   u32 callee_thread_id;
+   u64 callee_thread_id;
 } MemoryAccess;
 
-typedef struct LockAccess {
-   usize lock_address;
-   u32 callee_thread_id;
-} LockAccess;
+typedef enum LockWritability {
+    WriteHeld,    
+    ReadHeld,
+} LockWritability;
+
+typedef struct LockState {
+   LockWritability state;
+   usize addr;
+   u64 callee_thread_id;
+   usize lock_count;
+   usize unlock_count;
+} LockState;
 
 typedef struct MemoryAllocation {
    usize addr;
    u64 size;
-   u32 callee_thread_id;
+   u64 callee_thread_id;
 } MemoryAllocation;
 
 typedef struct ThreadState {
@@ -36,13 +44,9 @@ typedef struct ThreadState {
     u64 mem_write_set_capacity;
     u64 mem_write_set_len;
 
-    LockAccess *lock_unlock_set;
-    u64 lock_unlock_set_capacity;
-    u64 lock_unlock_set_len;
-
-    LockAccess *lock_lock_set;
-    u64 lock_lock_set_capacity;
-    u64 lock_lock_set_len;
+    LockState *lock_state_set;
+    u64 lock_state_set_capacity;
+    u64 lock_state_set_len;
 } ThreadState;
 
 
@@ -80,23 +84,19 @@ u32 is_in_range(u64 num, u64 min, u64 max) {
 void mem_analyse_exit() { 
     u64 j;
     for (j = 0; j < n_threads; j++) {
-        u64 i;
         printf("Thread id: %ld \n", threads[j].thread_id);
         printf("mem_write_set_len: %ld \n", threads[j].mem_write_set_len);
         printf("mem_read_set_len: %ld \n", threads[j].mem_read_set_len);
-        printf("unlocks: %ld \n", threads[j].lock_unlock_set_len);
-        printf("locks: %ld \n", threads[j].lock_lock_set_len);
-        // for (i = 0; i < threads[j].mem_write_set_len; i++) {
-        //     printf("[%d]tid write access to address: %ld, size: %ld, opcode: %s \n", threads[j].mem_write_set[i].thread_id, threads[j].mem_write_set[i].address_accessed, threads[j].mem_write_set[i].size, (threads[j].mem_read_set[i].opcode > REF_TYPE_WRITE) ? decode_opcode_name(threads[j].mem_read_set[i].opcode) /* opcode for instr */ : (threads[j].mem_read_set[i].opcode == REF_TYPE_WRITE ? "w" : "r"));        
-        // }
-        // for (i = 0; i < threads[j].mem_read_set_len; i++) {
-        //     printf("[%d]tid read access to address: %ld, size: %ld, opcode: %s \n", threads[j].mem_write_set[i].thread_id, threads[j].mem_read_set[i].address_accessed, threads[j].mem_read_set[i].size, (threads[j].mem_read_set[i].opcode > REF_TYPE_WRITE) ? decode_opcode_name(threads[j].mem_read_set[i].opcode) /* opcode for instr */ : (threads[j].mem_read_set[i].opcode == REF_TYPE_WRITE ? "w" : "r"));
-        // }
-
+        printf("lock_state_set_len: %ld \n", threads[j].lock_state_set_len);
+        
+        u64 i;
+        for (i = 0; i <= threads[j].lock_state_set_len; i++) {
+            printf("lock %ld, state: %d \n", threads[j].lock_state_set[i].addr, threads[j].lock_state_set[i].state);
+        }
+        
         free(threads[j].mem_write_set);
         free(threads[j].mem_read_set);
-        free(threads[j].lock_lock_set);
-        free(threads[j].lock_unlock_set);
+        free(threads[j].lock_state_set);
     }
 }
 
@@ -124,15 +124,9 @@ u32 mem_analyse_new_thread_init(void *drcontext) {
         return 0;
     }
 
-    threads[n_threads].lock_lock_set = (LockAccess*)malloc(sizeof(LockAccess) * linear_set_size_increment);
-    threads[n_threads].lock_lock_set_capacity = linear_set_size_increment;
-    if (threads[n_threads].lock_lock_set == NULL) {
-        printf("set allocation error \n");
-        return 0;
-    }
-    threads[n_threads].lock_unlock_set = (LockAccess*)malloc(sizeof(LockAccess) * linear_set_size_increment);
-    threads[n_threads].lock_unlock_set_capacity = linear_set_size_increment;    
-    if (threads[n_threads].lock_unlock_set == NULL) {
+    threads[n_threads].lock_state_set = (LockState*)malloc(sizeof(LockState) * linear_set_size_increment);
+    threads[n_threads].lock_state_set_capacity = linear_set_size_increment;
+    if (threads[n_threads].lock_state_set == NULL) {        
         printf("set allocation error \n");
         return 0;
     }
@@ -147,8 +141,9 @@ void mem_analyse_thread_exit() {
 
 
 void wrap_pre_unlock(void *wrapcxt, OUT void **user_data) {
+    // printf("pre UNLOCK\n");
     void *addr = drwrap_get_arg(wrapcxt, 0);
-    u64 thread_id = dr_get_thread_id(wrapcxt);
+    u64 thread_id = dr_get_thread_id(dr_get_current_drcontext());
     // printf("pthread_unlock called\n");
     i64 t_index = find_thread_by_tid(thread_id);
     if (t_index < 0) {
@@ -156,25 +151,51 @@ void wrap_pre_unlock(void *wrapcxt, OUT void **user_data) {
         return;    
     }
     ThreadState *thread_accessed = &threads[t_index];
-    thread_accessed->lock_unlock_set[thread_accessed->lock_unlock_set_len].lock_address = (u64)addr;
-    thread_accessed->lock_unlock_set[thread_accessed->lock_unlock_set_len].callee_thread_id = thread_id;
-    thread_accessed->lock_unlock_set_len += 1;
+    int i;
+    for (i = 0; i <= thread_accessed->lock_state_set_len; i++) {
+        if (thread_accessed->lock_state_set[i].addr == (usize)addr) break;
+        if (i >= thread_accessed->lock_state_set_len) {
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].addr = (usize)addr;
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].callee_thread_id = thread_id;
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].state = ReadHeld;
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].unlock_count += 1;
+            thread_accessed->lock_state_set_len += 1;
+            return;
+        };
+    }
+    thread_accessed->lock_state_set[i].unlock_count += 1;
+    if (thread_accessed->lock_state_set[i].unlock_count >= thread_accessed->lock_state_set[i].lock_count) {
+        thread_accessed->lock_state_set[i].state = ReadHeld;
+    }
 }
-
+// todo => handle post lock/unlock and check wether it was successfull!.
 void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
+    // printf("pre LOCK\n");
     void *addr = drwrap_get_arg(wrapcxt, 0);
-    // todo => wrong id
-    u64 thread_id = dr_get_thread_id(wrapcxt);
-    // printf("pthread lock: %ld\n", thread_id);
-    // printf("pthread_lock called %ld \n", thread_id);
+    u64 thread_id = dr_get_thread_id(dr_get_current_drcontext());
+    // printf("pthread_unlock called\n");
     i64 t_index = find_thread_by_tid(thread_id);
     if (t_index < 0) {
         // printf("error finding thread_id. %ld \n", thread_id);
-        return;        }
+        return;    
+    }
     ThreadState *thread_accessed = &threads[t_index];
-    thread_accessed->lock_lock_set[thread_accessed->lock_lock_set_len].lock_address = (u64)addr;
-    thread_accessed->lock_lock_set[thread_accessed->lock_lock_set_len].callee_thread_id = thread_id;
-    thread_accessed->lock_lock_set_len += 1;
+    int i;
+    for (i = 0; i <= thread_accessed->lock_state_set_len; i++) {
+        if (thread_accessed->lock_state_set[i].addr == (usize)addr) break;
+        if (i >= thread_accessed->lock_state_set_len) {
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].addr = (usize) addr;
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].callee_thread_id = thread_id;
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].state = WriteHeld;
+            thread_accessed->lock_state_set[thread_accessed->lock_state_set_len].lock_count += 1;
+            thread_accessed->lock_state_set_len += 1;
+            return;
+        };
+    }
+    thread_accessed->lock_state_set[i].lock_count += 1;
+    if (thread_accessed->lock_state_set[i].lock_count >= thread_accessed->lock_state_set[i].lock_count) {
+        thread_accessed->lock_state_set[i].state = WriteHeld;
+    }
 }
 
 void wrap_post_malloc(void *wrapcxt, void *user_data) {
@@ -193,17 +214,39 @@ void wrap_post_malloc(void *wrapcxt, void *user_data) {
     }
     // printf("ADDED %ld \n", thread_id);
     allocations[n_allocs].addr = (usize)addr;
-    allocations[n_allocs].callee_thread_id = 0;
+    allocations[n_allocs].callee_thread_id = thread_id;
     allocations[n_allocs].size = size;
     n_allocs += 1;
-
-    printf("n_allocs: %ld  %ld \n", n_allocs, thread_id);
 }
 void wrap_pre_malloc(void *wrapcxt, OUT void **user_data) {
     size_t alloc_size = (size_t)drwrap_get_arg(wrapcxt, 0);
     *user_data = (void *)alloc_size;
 }
 
+void check_for_race(ThreadState *thread_state) {
+    int write_set_i, read_set_i, lock_set_i1, lock_set_i2;
+    for (write_set_i = 0; write_set_i <= thread_state->mem_write_set_len; write_set_i++) {
+        for (lock_set_i2 = 0; lock_set_i2 <= thread_state->lock_state_set_len; lock_set_i2++) {
+            if(thread_state->lock_state_set[lock_set_i2].addr == thread_state->mem_write_set[write_set_i].address_accessed) {
+                // u32 lock_found = 0;
+
+                // for (read_set_i = 0; read_set_i <= thread_state->mem_read_set_len; read_set_i++) {
+                //     if(thread_state->lock_state_set[lock_set_i2].addr == thread_state->mem_read_set[read_set_i].address_accessed) {
+                //         for (lock_set_i1 = 0; lock_set_i1 <= thread_state->lock_state_set_len; lock_set_i1++) {
+                //             if(thread_state->lock_state_set[lock_set_i2].addr == thread_state->lock_state_set[lock_set_i1].addr) {
+                //                 lock_found = 1;
+                //             }
+                //         }
+                //     }
+                // }
+
+                // if (lock_found) {
+                //     printf("NO RACE CONDITION \n");
+                // }
+            }
+        }
+    }
+}
 
 // this is an event like fn that is envoked on every memory access (called by DynamRIO)
 void memtrace(void *drcontext, u64 thread_id) {
@@ -223,10 +266,10 @@ void memtrace(void *drcontext, u64 thread_id) {
         int j;
         for(j = 0; j < n_allocs; j++) {
             if (is_in_range((usize)mem_ref->addr, allocations[j].addr, allocations[j].addr + allocations[j].size)) break;
-            // printf("%ld %ld-%ld \n", (usize)mem_ref->addr, allocations[j].addr, allocations[j].addr + allocations[j].size);
-            if (j == n_allocs-1) { 
-                BUF_PTR(data->seg_base) = data->buf_base;
-                return;
+            
+            if (j >= n_allocs-1) { 
+                // commiting a sin but goto is the most simple way to continue an outer loop in C
+                goto continue_outer_loop;
             }
         }
         // no allocations, no mem shared
@@ -234,10 +277,10 @@ void memtrace(void *drcontext, u64 thread_id) {
             BUF_PTR(data->seg_base) = data->buf_base;
             return;
         }
-        printf("COMING THROUGH\n");
         u64 thread_id_owning_accessed_addr = allocations[j].callee_thread_id;
+        // printf("COMING THROUGH %ld \n", thread_id_owning_accessed_addr);
 
-        u64 thread_states_index_owning_accessed_addr = find_thread_by_tid(thread_id_owning_accessed_addr);
+        i64 thread_states_index_owning_accessed_addr = find_thread_by_tid(thread_id_owning_accessed_addr);
         if (thread_states_index_owning_accessed_addr < 0) {
             printf("error finding thread_id. %ld \n", thread_id);
             BUF_PTR(data->seg_base) = data->buf_base;
@@ -269,6 +312,8 @@ void memtrace(void *drcontext, u64 thread_id) {
         // }
         // // /* We use PIFX to avoid leading zeroes and shrink the resulting file. */
         // fprintf(data->logf, "" PIFX ": %2d, %s (%d)\n", (ptr_uint_t)mem_ref->addr, mem_ref->size, (mem_ref->type > REF_TYPE_WRITE) ? decode_opcode_name(mem_ref->type) /* opcode for instr */ : (mem_ref->type == REF_TYPE_WRITE ? "w" : "r"), mem_ref->type);
+        continue_outer_loop:;
+        check_for_race(thread_accessed);
         data->num_refs++;
         BUF_PTR(data->seg_base) = data->buf_base;
     }

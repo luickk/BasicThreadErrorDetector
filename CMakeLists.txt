@@ -1,5 +1,5 @@
 project(sample)
-add_library(myclient SHARED memtrace.c error_detector.c)
+add_library(myclient SHARED instrument.c error_detector.c)
 target_include_directories(myclient PRIVATE ${include/})
 find_package(DynamoRIO PATHS ../DynamoRIO/cmake)
 if (NOT DynamoRIO_FOUND)
