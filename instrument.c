@@ -56,7 +56,7 @@ module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
         DR_ASSERT(ok);
     }
     size_t modoffs_malloc;
-    drsym_error_t sym_res_malloc = drsym_lookup_symbol(mod->full_path, "malloc", &modoffs_malloc, DRSYM_DEMANGLE);
+    drsym_error_t sym_res_malloc = drsym_lookup_symbol(mod->full_path, "detector_malloc", &modoffs_malloc, DRSYM_DEMANGLE);
     if (sym_res_malloc == DRSYM_SUCCESS) {
         app_pc towrap_malloc = mod->start + modoffs_malloc;
         bool ok = drwrap_wrap(towrap_malloc, wrap_pre_malloc, wrap_post_malloc);

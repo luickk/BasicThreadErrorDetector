@@ -1,5 +1,5 @@
 project(sample)
-add_library(myclient SHARED instrument.c error_detector.c)
+add_library(myclient SHARED instrument.c race_detector.c)
 target_include_directories(myclient PRIVATE ${include/})
 find_package(DynamoRIO PATHS ../Libs/DynamoRIO-AArch64-Linux-9.0.1/cmake)
 if (NOT DynamoRIO_FOUND)

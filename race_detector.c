@@ -4,6 +4,20 @@
 #define MAX_ALLOCS 10000
 const u64 linear_set_size_increment = 1000000;
 
+
+
+typedef enum LockWritability {
+    WriteHeld,    
+    ReadHeld,
+} LockWritability;
+
+typedef struct LockAccess {
+   LockWritability state;
+   usize addr;
+   u64 callee_thread_id;
+} LockAccess;
+
+
 // todo => shrink to 8 bytes. Should be possible if memory address access/accessing only store 
 // bytes of the virtual address that define the memory locations relative to the process pages)
 // reference: https://developer.arm.com/documentation/den0024/a/The-Memory-Management-Unit/Translating-a-Virtual-Address-to-a-Physical-Address
@@ -14,12 +28,10 @@ typedef struct MemoryAccess {
    u64 size;
    u64 callee_thread_id;
    u64 memory_access_count;
+   u32 has_lock;
+   LockAccess lock_access;
 } MemoryAccess;
 
-typedef enum LockWritability {
-    WriteHeld,    
-    ReadHeld,
-} LockWritability;
 
 typedef struct LockState {
    LockWritability state;
@@ -29,13 +41,6 @@ typedef struct LockState {
    usize unlock_count;
 } LockState;
 
-
-typedef struct LockAccess {
-   LockWritability state;
-   usize addr;
-   u64 callee_thread_id;
-   u64 memory_access_count;
-} LockAccess;
 
 typedef struct MemoryAllocation {
    usize addr;
@@ -54,19 +59,15 @@ typedef struct ThreadState {
     u64 mem_write_set_capacity;
     u64 mem_write_set_len;
 
-
     LockState *lock_state_set;
     u64 lock_state_set_capacity;
     u64 lock_state_set_len;
 
-    LockAccess *lock_write_held_set;
-    u64 lock_write_held_set_capacity;
-    u64 lock_write_held_set_len;
-
-    LockAccess *lock_read_held_set;
-    u64 lock_read_held_set_capacity;
-    u64 lock_read_held_set_len;
+    usize last_locked_mutex_addr;
 } ThreadState;
+
+usize debug_ok_checks = 0;
+usize debug_error_checks = 0;
 
 
 // max allocations is seperate from thread state since it needs to be itreated thorugh on every error check
@@ -95,15 +96,15 @@ i64 find_thread_by_tid(u64 tid) {
     return -1;
 }
 
-i64 find_lockset_by_memory_access_count(LockAccess *lock_set, u64 lock_set_len, u64 access_count) {
-    u64 i;
-    for (i = 0; i <= lock_set_len; i++) {
-        if (lock_set[i].memory_access_count == access_count) {
-            return i;
-        }
-    }
-    return -1;
-}
+// i64 find_lockset_by_memory_access_count(LockAccess *lock_set, u64 lock_set_len, u64 access_count) {
+//     u64 i;
+//     for (i = 0; i <= lock_set_len; i++) {
+//         if (lock_set[i].memory_access_count == access_count) {
+//             return i;
+//         }
+//     }
+//     return -1;
+// }
 
 u32 is_in_range(u64 num, u64 min, u64 max) {      
     return (min <= num && num <= max); 
@@ -118,18 +119,18 @@ void mem_analyse_exit() {
         printf("mem_write_set_len: %ld \n", threads[j].mem_write_set_len);
         printf("mem_read_set_len: %ld \n", threads[j].mem_read_set_len);
         printf("lock_state_set_len: %ld \n", threads[j].lock_state_set_len);
-        
+            
         u64 i;
+        printf("locks: \n");
         for (i = 0; i <= threads[j].lock_state_set_len; i++) {
-            printf("lock %ld, state: %d \n", threads[j].lock_state_set[i].addr, threads[j].lock_state_set[i].state);
+            printf("lock addr: %ld, (end)state: %d \n", threads[j].lock_state_set[i].addr, threads[j].lock_state_set[i].state);
         }
         
         free(threads[j].mem_write_set);
         free(threads[j].mem_read_set);
         free(threads[j].lock_state_set);
-        free(threads[j].lock_write_held_set);
-        free(threads[j].lock_read_held_set);
     }
+    printf("debug error checks: %ld, ok checks: %ld \n", debug_error_checks, debug_ok_checks);
 }
 
 u32 mem_analyse_init() { 
@@ -159,20 +160,6 @@ u32 mem_analyse_new_thread_init(void *drcontext) {
     threads[n_threads].lock_state_set = (LockState*)malloc(sizeof(LockState) * linear_set_size_increment);
     threads[n_threads].lock_state_set_capacity = linear_set_size_increment;
     if (threads[n_threads].lock_state_set == NULL) {        
-        printf("set allocation error \n");
-        return 0;
-    }
-
-    threads[n_threads].lock_write_held_set = (LockAccess*)malloc(sizeof(LockAccess) * linear_set_size_increment);
-    threads[n_threads].lock_write_held_set_capacity = linear_set_size_increment;
-    if (threads[n_threads].lock_write_held_set == NULL) {        
-        printf("set allocation error \n");
-        return 0;
-    }
-
-    threads[n_threads].lock_read_held_set = (LockAccess*)malloc(sizeof(LockAccess) * linear_set_size_increment);
-    threads[n_threads].lock_read_held_set_capacity = linear_set_size_increment;
-    if (threads[n_threads].lock_read_held_set == NULL) {        
         printf("set allocation error \n");
         return 0;
     }
@@ -239,19 +226,10 @@ void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
         };
     }
     thread_accessed->lock_state_set[i].lock_count += 1;
-    if (thread_accessed->lock_state_set[i].lock_count >= thread_accessed->lock_state_set[i].lock_count) {
-        // now the lock is write held
-        thread_accessed->lock_write_held_set[thread_accessed->lock_write_held_set_len].addr = (usize) addr;
-        thread_accessed->lock_write_held_set[thread_accessed->lock_write_held_set_len].callee_thread_id = thread_id;
-        thread_accessed->lock_write_held_set[thread_accessed->lock_write_held_set_len].memory_access_count = memory_access_counter;
-        thread_accessed->lock_write_held_set_len += 1;
-    } else {
-        // read held
-        thread_accessed->lock_read_held_set[thread_accessed->lock_read_held_set_len].addr = (usize) addr;
-        thread_accessed->lock_read_held_set[thread_accessed->lock_read_held_set_len].callee_thread_id = thread_id;
-        thread_accessed->lock_read_held_set[thread_accessed->lock_read_held_set_len].memory_access_count = memory_access_counter;
-        thread_accessed->lock_read_held_set_len += 1;
+    if (thread_accessed->lock_state_set[i].unlock_count <= thread_accessed->lock_state_set[i].lock_count) {
+        thread_accessed->lock_state_set[i].state = WriteHeld;
     }
+    thread_accessed->last_locked_mutex_addr = (usize)addr;
 }
 
 void wrap_post_malloc(void *wrapcxt, void *user_data) {
@@ -268,7 +246,6 @@ void wrap_post_malloc(void *wrapcxt, void *user_data) {
         if (threads[j].thread_id == thread_id) break;
         if (j == n_threads-1) return;
     }
-    // printf("ADDED %ld \n", thread_id);
     allocations[n_allocs].addr = (usize)addr;
     allocations[n_allocs].callee_thread_id = thread_id;
     allocations[n_allocs].size = size;
@@ -280,13 +257,24 @@ void wrap_pre_malloc(void *wrapcxt, OUT void **user_data) {
 }
 
 void check_for_race(ThreadState *thread_state) {
-    int write_set_i, read_set_i, lock_set_i1, lock_set_i2;
+    int write_set_i, read_set_i;
     for (write_set_i = 0; write_set_i <= thread_state->mem_write_set_len; write_set_i++) {
         for (read_set_i = 0; read_set_i <= thread_state->mem_read_set_len; read_set_i++) {
+            // check write-read pairs
             if (thread_state->mem_write_set[write_set_i].memory_access_count > thread_state->mem_read_set[read_set_i].memory_access_count) {
-                if (find_lockset_by_memory_access_count(thread_state->lock_write_held_set, thread_state->lock_write_held_set_len, thread_state->lock_write_held_set[write_set_i].memory_access_count) == -1 || find_lockset_by_memory_access_count(thread_state->lock_write_held_set, thread_state->lock_write_held_set_len, thread_state->mem_read_set[read_set_i].memory_access_count) == -1) {
-                    printf("FOUND!\n");
+                if(!thread_state->mem_write_set[write_set_i].has_lock && !thread_state->mem_read_set[write_set_i].has_lock) {
+                    // printf("found read race for addr: %ld in thread: %ld \n", thread_state->mem_write_set[write_set_i].address_accessed, thread_state->mem_write_set[write_set_i].callee_thread_id);
+                    debug_error_checks += 1;
+                } else {
+                    debug_ok_checks += 1;
                 }
+            }
+            // write write-read pairs
+            if(!thread_state->mem_write_set[write_set_i].has_lock && !thread_state->mem_write_set[write_set_i+1].has_lock) {
+                // printf("found write race for addr: %ld in thread: %ld \n", thread_state->mem_write_set[write_set_i].address_accessed, thread_state->mem_write_set[write_set_i].callee_thread_id);
+                debug_error_checks += 1;
+            } else {
+                debug_ok_checks += 1;
             }
         }
     }
@@ -311,7 +299,8 @@ void memtrace(void *drcontext, u64 thread_id) {
         for(j = 0; j < n_allocs; j++) {
             if (is_in_range((usize)mem_ref->addr, allocations[j].addr, allocations[j].addr + allocations[j].size)) break;
             
-            if (j >= n_allocs-1) { 
+            if (j >= n_allocs-1 || n_allocs == 0) { 
+                // printf("not found \n");
                 // commiting a sin but goto is the most simple way to continue an outer loop in C
                 goto continue_outer_loop;
             }
@@ -333,7 +322,14 @@ void memtrace(void *drcontext, u64 thread_id) {
             return;    
         }
         ThreadState *thread_accessed = &threads[thread_states_index_owning_accessed_addr];
-        // printf("adding %d \n", thread_states_index_owning_accessed_addr);
+
+        i32 lock_state_i;
+        for (lock_state_i = 0; lock_state_i <= thread_accessed->lock_state_set_len; lock_state_i++) {
+            if (thread_accessed->lock_state_set[lock_state_i].addr == thread_accessed->last_locked_mutex_addr) {
+                break;
+            }
+            if (lock_state_i >= thread_accessed->lock_state_set_len) lock_state_i = -1;
+        }
         if (mem_ref->type == 1 || mem_ref->type == 457 || mem_ref->type == 458 || mem_ref->type == 456 || mem_ref->type == 568) {
             // mem write
             if (thread_accessed->mem_write_set_len >= thread_accessed->mem_write_set_capacity) thread_accessed->mem_write_set = increase_set_capacity(thread_accessed->mem_write_set, &thread_accessed->mem_write_set_capacity);
@@ -343,6 +339,11 @@ void memtrace(void *drcontext, u64 thread_id) {
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].callee_thread_id = thread_id;
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].size = mem_ref->size;
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].memory_access_count = memory_access_counter;
+            if (lock_state_i != -1) {
+                LockAccess la = {thread_accessed->lock_state_set[lock_state_i].state, thread_accessed->lock_state_set[lock_state_i].addr, thread_accessed->lock_state_set[lock_state_i].callee_thread_id};
+                thread_accessed->mem_write_set[thread_accessed->mem_read_set_len].lock_access = la;
+                thread_accessed->mem_write_set[thread_accessed->mem_read_set_len].has_lock = 1;
+            }
             thread_accessed->mem_write_set_len += 1;
         } else if(mem_ref->type == 0 || mem_ref->type == 227 || mem_ref->type == 225 || mem_ref->type == 197 || mem_ref->type == 228 || mem_ref->type == 229 || mem_ref->type == 299 || mem_ref->type == 173) {
             // mem read
@@ -353,6 +354,11 @@ void memtrace(void *drcontext, u64 thread_id) {
             thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].callee_thread_id = thread_id;
             thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].size = mem_ref->size;
             thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].memory_access_count = memory_access_counter;
+            if (lock_state_i != -1) {
+                LockAccess la = {thread_accessed->lock_state_set[lock_state_i].state, thread_accessed->lock_state_set[lock_state_i].addr, thread_accessed->lock_state_set[lock_state_i].callee_thread_id};
+                thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].lock_access = la;
+                thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].has_lock = 1;
+            }
             thread_accessed->mem_read_set_len += 1;
         }
         check_for_race(thread_accessed);

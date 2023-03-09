@@ -1,6 +1,6 @@
 # Basic Thread Error Detector based on DynamoRIO
 
-The project is split into `instrument.c` which only contains purely technical (memory instrumentation, fn wrapping..) DynamorRIO api setup/config and `error_detector.c` which contains the race detector implementation described in [this](https://storage.googleapis.com/pub-tools-public-publication-data/pdf/35604.pdf) paper. All events are "exported" in instrument.h and implemented by error_detector.c (fed to DynamoRIO by `instrument.c`).
+The project is split into `instrument.c` which only contains purely technical (memory instrumentation, fn wrapping..) DynamorRIO api setup/config and `race_detector.c` which contains the race detector implementation described in [this](https://storage.googleapis.com/pub-tools-public-publication-data/pdf/35604.pdf) paper. All events are "exported" in instrument.h and implemented by race_detector.c (fed to DynamoRIO by `instrument.c`).
 
 The detector is fully build on a clock-vector before/after relations mechanism to detect races.
 
