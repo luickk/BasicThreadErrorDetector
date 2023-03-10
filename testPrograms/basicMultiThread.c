@@ -14,16 +14,10 @@ void *detector_malloc(size_t size) {
 void *myThreadFun(void *tid) {
 	int myid = (int)tid;
 
-	// pthread_mutex_lock(&mutex_g);
+	pthread_mutex_lock(&mutex_g);
 	heap_storage[10] = 1;
-	// pthread_mutex_unlock(&mutex_g);
-
-	static int s = 0;
-
-	++s; 
-	++g;
-
-	printf("Thread ID: %d, Static: %d, Global: %d\n", myid, ++s, ++g);
+	pthread_mutex_unlock(&mutex_g);
+	printf("heap_storage index 10: %d \n", heap_storage[10]);
 }
 
 int main() {
