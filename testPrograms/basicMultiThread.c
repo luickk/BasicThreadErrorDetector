@@ -17,7 +17,8 @@ void *myThreadFun(void *tid) {
 	pthread_mutex_lock(&mutex_g);
 	heap_storage[10] = 1;
 	pthread_mutex_unlock(&mutex_g);
-	printf("heap_storage index 10: %d \n", heap_storage[10]);
+	// heap_storage[11] = 1;
+	// printf("heap_storage index 10: %d \n", heap_storage[10]);
 }
 
 int main() {
