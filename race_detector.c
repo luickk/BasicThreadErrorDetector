@@ -192,11 +192,15 @@ void wrap_pre_unlock(void *wrapcxt, OUT void **user_data) {
     if (program_locks[i].unlock_count >= program_locks[i].lock_count) {
         program_locks[i].state = ReadHeld;
     }
-    pthread_mutex_unlock(&mutex_program_locks);
     thread_accessed->last_locked_mutex_addr = -1;
+    pthread_mutex_unlock(&mutex_program_locks);
 }
 // todo => handle post lock/unlock and check wether it was successfull!.
 void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
+    // wait(10000000000000);
+
+    int i;
+    for(i = 0; i <= 100000000; i++) {}
     // printf("pre LOCK\n");
     void *addr = drwrap_get_arg(wrapcxt, 0);
     // printf("locking: %ld \n", addr);
@@ -208,10 +212,11 @@ void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
         return;    
     }
     ThreadState *thread_accessed = &program_threads[t_index];
+    // printf("--: %d %d \n ", (usize)addr, thread_id);
     pthread_mutex_lock(&mutex_program_threads);
     thread_accessed->last_locked_mutex_addr = (usize)addr;
     pthread_mutex_unlock(&mutex_program_threads);
-    int i;
+    // int i;
     for (i = 0; i <= n_program_locks; i++) {
         if (program_locks[i].addr == (usize)addr) break;
         if (i >= n_program_locks) {
@@ -263,6 +268,10 @@ void wrap_pre_malloc(void *wrapcxt, OUT void **user_data) {
 }
 
 void check_for_race(ThreadState *thread_state) {
+    // int i;
+    // for (i = 0; i <= thread_state->mem_write_set_len; i++) {
+    //     printf("state %d \n", thread_state->mem_write_set[i].lock_access.state);
+    // }
     int thread_i, write_set_i, write_set_i_plus1, read_set_i;
     for (write_set_i = 0; write_set_i < thread_state->mem_write_set_len; write_set_i++) {
         for (thread_i = 0; thread_i < n_program_threads; thread_i++) {
@@ -282,14 +291,12 @@ void check_for_race(ThreadState *thread_state) {
             }   
             // write write-read pairs
             for (write_set_i_plus1 = 0; write_set_i_plus1 < iterated_thread->mem_write_set_len; write_set_i_plus1++) {
-                if (thread_state->mem_write_set[write_set_i].address_accessed == iterated_thread->mem_write_set[write_set_i_plus1].address_accessed) {
-                    if (thread_state->mem_write_set[write_set_i].callee_thread_id != iterated_thread->mem_write_set[write_set_i_plus1].callee_thread_id) {
+                if (thread_state->mem_write_set[write_set_i].address_accessed == iterated_thread->mem_write_set[write_set_i_plus1+1].address_accessed) {
+                    if (thread_state->mem_write_set[write_set_i].callee_thread_id != iterated_thread->mem_write_set[write_set_i_plus1+1].callee_thread_id) {
                         // printf("addr match(not smae thread id) %ld, %ld \n", thread_state->mem_write_set[write_set_i].address_accessed, iterated_thread->mem_write_set[write_set_i_plus1].address_accessed);
-                        if(thread_state->mem_write_set[write_set_i].lock_access.state != WriteHeld && iterated_thread->mem_write_set[write_set_i_plus1].lock_access.state != WriteHeld) {
+                        if(thread_state->mem_write_set[write_set_i].lock_access.state != WriteHeld && iterated_thread->mem_write_set[write_set_i_plus1+1].lock_access.state != WriteHeld) {
                             detected_races_counter += 1;
                             printf("race on: %ld \n", thread_state->mem_write_set[write_set_i].address_accessed);
-                            // printf("lol\n");
-                            // printf("state match %d, %d \n", thread_state->mem_write_set[write_set_i].lock_access.state, iterated_thread->mem_write_set[write_set_i_plus1].lock_access.state);
                             break;
                         }
                     }
@@ -374,6 +381,7 @@ void memtrace(void *drcontext, u64 thread_id) {
                 // todo => should not be invoked
                 printf("no lock for addr %ld \n", mem_ref->addr);
             }
+            printf("held: %d \n", program_locks[lock_state_i].state);
             thread_accessed->mem_write_set_len += 1;
         } else if(mem_ref->type == 0 || mem_ref->type == 227 || mem_ref->type == 225 || mem_ref->type == 197 || mem_ref->type == 228 || mem_ref->type == 229 || mem_ref->type == 299 || mem_ref->type == 173) {
             // mem read
@@ -391,8 +399,10 @@ void memtrace(void *drcontext, u64 thread_id) {
             } else {
                 printf("no lock for addr %ld \n", mem_ref->addr);
             }
+            printf("held: %d \n", program_locks[lock_state_i].state);
             thread_accessed->mem_read_set_len += 1;
         }
+
         pthread_mutex_unlock(&mutex_program_threads);
         check_for_race(thread_accessed);
         continue_outer_loop:;

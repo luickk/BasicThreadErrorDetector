@@ -2,6 +2,7 @@
 #include <stddef.h> /* for offsetof */
 #include <string.h>
 #include <pthread.h>
+#include<sys/wait.h>
 #include <sys/syscall.h>
 #include "dr_api.h"
 #include "drmgr.h"
