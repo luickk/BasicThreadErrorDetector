@@ -69,12 +69,15 @@ usize detected_races_counter = 0;
 
 // max program_allocations is seperate from thread state since it needs to be itreated thorugh on every error check
 MemoryAllocation program_allocations[MAX_ALLOCS] = {};
+pthread_mutex_t mutex_program_allocs = PTHREAD_MUTEX_INITIALIZER;
 u64 n_program_allocs = 0;
 
 ThreadState program_threads[MAX_THREADS] = {};
+pthread_mutex_t mutex_program_threads = PTHREAD_MUTEX_INITIALIZER;
 u64 n_program_threads = 0;
 
 LockState program_locks[MAX_LOCKS] = {};
+pthread_mutex_t mutex_program_locks = PTHREAD_MUTEX_INITIALIZER;
 u64 n_program_locks;
 
 u64 memory_access_counter = 0;
@@ -172,24 +175,31 @@ void wrap_pre_unlock(void *wrapcxt, OUT void **user_data) {
     for (i = 0; i <= n_program_locks; i++) {
         if (program_locks[i].addr == (usize)addr) break;
         if (i >= n_program_locks) {
+            pthread_mutex_lock(&mutex_program_locks);
             program_locks[n_program_locks].addr = (usize)addr;
             program_locks[n_program_locks].callee_thread_id = thread_id;
             program_locks[n_program_locks].state = ReadHeld;
             program_locks[n_program_locks].unlock_count += 1;
+            // printf("new addr: %ld \n", program_locks[n_program_locks].addr);
             n_program_locks += 1;
+            pthread_mutex_unlock(&mutex_program_locks);
             return;
         };
     }
+
+    pthread_mutex_lock(&mutex_program_locks);
     program_locks[i].unlock_count += 1;
     if (program_locks[i].unlock_count >= program_locks[i].lock_count) {
         program_locks[i].state = ReadHeld;
     }
+    pthread_mutex_unlock(&mutex_program_locks);
     thread_accessed->last_locked_mutex_addr = -1;
 }
 // todo => handle post lock/unlock and check wether it was successfull!.
 void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
     // printf("pre LOCK\n");
     void *addr = drwrap_get_arg(wrapcxt, 0);
+    // printf("locking: %ld \n", addr);
     u64 thread_id = dr_get_thread_id(dr_get_current_drcontext());
     // printf("pthread_unlock called\n");
     i64 t_index = find_thread_by_tid(thread_id);
@@ -198,24 +208,32 @@ void wrap_pre_lock(void *wrapcxt, OUT void **user_data) {
         return;    
     }
     ThreadState *thread_accessed = &program_threads[t_index];
+    pthread_mutex_lock(&mutex_program_threads);
+    thread_accessed->last_locked_mutex_addr = (usize)addr;
+    pthread_mutex_unlock(&mutex_program_threads);
     int i;
     for (i = 0; i <= n_program_locks; i++) {
         if (program_locks[i].addr == (usize)addr) break;
         if (i >= n_program_locks) {
+            pthread_mutex_lock(&mutex_program_locks);
             program_locks[n_program_locks].addr = (usize) addr;
             program_locks[n_program_locks].callee_thread_id = thread_id;
             program_locks[n_program_locks].state = WriteHeld;
             program_locks[n_program_locks].lock_count += 1;
+
             n_program_locks += 1;
+            pthread_mutex_unlock(&mutex_program_locks);
             return;
         };
     }
+
+    pthread_mutex_lock(&mutex_program_locks);
     program_locks[i].lock_count += 1;
     // todo => check wether it has to be < or <=
     if (program_locks[i].unlock_count <= program_locks[i].lock_count) {
         program_locks[i].state = WriteHeld;
     }
-    thread_accessed->last_locked_mutex_addr = (usize)addr;
+    pthread_mutex_unlock(&mutex_program_locks);
 }
 
 void wrap_post_malloc(void *wrapcxt, void *user_data) {
@@ -232,10 +250,12 @@ void wrap_post_malloc(void *wrapcxt, void *user_data) {
         if (program_threads[j].thread_id == thread_id) break;
         if (j == n_program_threads-1) return;
     }
+    pthread_mutex_lock(&mutex_program_allocs);
     program_allocations[n_program_allocs].addr = (usize)addr;
     program_allocations[n_program_allocs].callee_thread_id = thread_id;
     program_allocations[n_program_allocs].size = size;
     n_program_allocs += 1;
+    pthread_mutex_unlock(&mutex_program_allocs);
 }
 void wrap_pre_malloc(void *wrapcxt, OUT void **user_data) {
     size_t alloc_size = (size_t)drwrap_get_arg(wrapcxt, 0);
@@ -296,7 +316,7 @@ void memtrace(void *drcontext, u64 thread_id) {
     }
     for (mem_ref = (mem_ref_t *)data->buf_base; mem_ref < buf_ptr; mem_ref++) {
         int j;
-        
+
         // no program_allocations, no mem shared
         if (n_program_allocs <= 0) {
             BUF_PTR(data->seg_base) = data->buf_base;
@@ -322,21 +342,26 @@ void memtrace(void *drcontext, u64 thread_id) {
             return;    
         }
         ThreadState *thread_accessed = &program_threads[thread_states_index_owning_accessed_addr];
-
+        pthread_mutex_lock(&mutex_program_threads);
         i32 lock_state_i;
         if (thread_accessed->last_locked_mutex_addr != -1) {
             for (lock_state_i = 0; lock_state_i <= n_program_locks; lock_state_i++) {
                 if (program_locks[lock_state_i].addr == thread_accessed->last_locked_mutex_addr) {
+                    // printf("found: %ld %ld \n", program_locks[lock_state_i].addr, thread_accessed->last_locked_mutex_addr);
                     break;
                 }
                 if (lock_state_i >= n_program_locks) lock_state_i = -1;
             }
-        } else lock_state_i = thread_accessed->last_locked_mutex_addr;
+        } else {
+            lock_state_i = thread_accessed->last_locked_mutex_addr;
+            printf("asdassa \n");
+        }
         if (mem_ref->type == 1 || mem_ref->type == 457 || mem_ref->type == 458 || mem_ref->type == 456 || mem_ref->type == 568) {
             // mem write
             if (thread_accessed->mem_write_set_len >= thread_accessed->mem_write_set_capacity) thread_accessed->mem_write_set = increase_set_capacity(thread_accessed->mem_write_set, &thread_accessed->mem_write_set_capacity);
             if (thread_accessed->mem_write_set == NULL) exit(1);
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].address_accessed = (usize)mem_ref->addr;
+            // printf("added to write set: %ld \n", (usize)mem_ref->addr);
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].opcode = mem_ref->type;
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].callee_thread_id = thread_id;
             thread_accessed->mem_write_set[thread_accessed->mem_write_set_len].size = mem_ref->size;
@@ -347,7 +372,7 @@ void memtrace(void *drcontext, u64 thread_id) {
                 thread_accessed->mem_write_set[thread_accessed->mem_read_set_len].has_lock = 1;
             } else {
                 // todo => should not be invoked
-                printf("no lock set for addr %ld \n", mem_ref->addr);
+                printf("no lock for addr %ld \n", mem_ref->addr);
             }
             thread_accessed->mem_write_set_len += 1;
         } else if(mem_ref->type == 0 || mem_ref->type == 227 || mem_ref->type == 225 || mem_ref->type == 197 || mem_ref->type == 228 || mem_ref->type == 229 || mem_ref->type == 299 || mem_ref->type == 173) {
@@ -364,10 +389,11 @@ void memtrace(void *drcontext, u64 thread_id) {
                 thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].lock_access = la;
                 thread_accessed->mem_read_set[thread_accessed->mem_read_set_len].has_lock = 1;
             } else {
-                printf("no lock set for addr %ld \n", mem_ref->addr);
+                printf("no lock for addr %ld \n", mem_ref->addr);
             }
             thread_accessed->mem_read_set_len += 1;
         }
+        pthread_mutex_unlock(&mutex_program_threads);
         check_for_race(thread_accessed);
         continue_outer_loop:;
         data->num_refs++;
