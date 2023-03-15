@@ -14,12 +14,10 @@ void *detector_malloc(size_t size) {
 void *myThreadFun(void *tid) {
 	int myid = (int)tid;
 
-	// pthread_mutex_lock(&mutex_g);
+	pthread_mutex_lock(&mutex_g);
+	printf("heap_storage index 10: %d \n", heap_storage[10]);
 	heap_storage[10] = 1;
-	// pthread_mutex_unlock(&mutex_g);
-	// printf("write doen \n");
-	// heap_storage[11] = 1;
-	// printf("heap_storage index 10: %d \n", heap_storage[10]);
+	pthread_mutex_unlock(&mutex_g);
 }
 
 int main() {
@@ -34,7 +32,8 @@ int main() {
 		last_tid = pthread_create(&tid, NULL, myThreadFun, (void *)tid);
 		// pthread_join(last_tid, NULL);
 
+	// insures that the program doesn't quit before the threads didn't end
+	// pthread_joind confuses Dynamorio and wait syscalls get blocked so this is an ugly solution
 	for (i = 0; i <= 10000000; i++) {}
-	// pthread_join(last_tid, NULL);
 	return 0;
 }
